@@ -1,0 +1,193 @@
+-- | This module defines the core smart contracts for the Canton Name Service (CNS),
+-- | a decentralized, privacy-preserving name registry for Canton party identifiers.
+-- | It includes templates for the main registry, name registrations, and the
+-- | associated proposal/acceptance workflows for registration and transfer.
+-- |
+-- | The key features of this model are:
+-- | - Uniqueness: A name can only be registered once per authority, enforced by contract keys.
+-- | - Ownership: Each name has a designated owner with full control over it.
+-- | - Privacy: Name-to-party resolution is only possible for parties explicitly granted
+-- |   observer status by the name's owner.
+-- | - Standard Workflows: Utilizes the proposal/acceptance pattern for safe, two-party
+-- |   interactions like registration and ownership transfer.
+module CNS.Registry where
+
+import DA.Time (Time)
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Text as T
+
+-- | A human-readable identifier for a Canton party.
+-- | This is the core type for names registered in the CNS.
+type Name = Text
+
+-- | Checks if a name is valid according to CNS rules.
+-- | Rules: lowercase, alphanumeric characters and hyphens, between 3 and 63 chars long.
+isValidName : Name -> Bool
+isValidName name =
+  let len = T.length name
+      validChars = T.all (\c -> (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') name
+  in len >= 3 && len <= 63 && validChars
+
+-- | The root contract for a Canton Name Service instance.
+-- | It is managed by a single authority and acts as a factory for name registrations.
+-- | Its presence on the ledger establishes a namespace.
+template Registry
+  with
+    authority : Party
+  where
+    signatory authority
+
+    key authority : Party
+    maintainer key
+
+    -- | The authority proposes to register a new name for an owner.
+    -- | This initiates the registration process via a proposal/acceptance flow.
+    choice OfferRegistration : ContractId RegistrationOffer
+      with
+        name : Name
+        owner : Party
+        resolver : Party
+        validUntil : Time
+      controller authority
+      do
+        assertMsg "Invalid name format. Must be 3-63 lowercase alphanumeric characters or hyphens." (isValidName name)
+        create RegistrationOffer with ..
+
+-- | An offer from the authority to register a name for a specific owner.
+-- | This contract must be accepted by the prospective owner to finalize the registration.
+template RegistrationOffer
+  with
+    authority : Party
+    name : Name
+    owner : Party
+    resolver : Party
+    validUntil : Time
+  where
+    signatory authority
+    observer owner
+
+    -- | The prospective owner accepts the offer, creating the official `NameRegistration` contract.
+    choice Accept : ContractId NameRegistration
+      controller owner
+      do
+        -- Observers default to the owner and authority, establishing a baseline of visibility.
+        let observers = Set.fromList [owner, authority]
+        create NameRegistration with ..
+
+    -- | The prospective owner declines the registration offer, archiving the contract.
+    choice Decline : ()
+      controller owner
+      do
+        pure ()
+
+-- | Represents a single, unique name registration within the CNS.
+-- | The contract key on `(authority, name)` ensures uniqueness across the ledger for a given namespace.
+-- | The `observers` field is the core of the privacy model, controlling who can resolve this name.
+template NameRegistration
+  with
+    authority : Party
+    name : Name
+    owner : Party
+    resolver : Party
+    validUntil : Time
+    observers : Set Party
+  where
+    signatory owner
+    observer (Set.toList observers)
+
+    key (authority, name) : (Party, Name)
+    maintainer key._1
+
+    ensure
+      -- These invariants are critical for the security and integrity of the registration.
+      -- The owner and authority must always be able to observe the registration.
+      Set.member owner observers && Set.member authority observers
+
+    -- | Allows the owner to update the party ID that the name resolves to.
+    choice UpdateResolver : ContractId NameRegistration
+      with
+        newResolver : Party
+      controller owner
+      do
+        create this with resolver = newResolver
+
+    -- | Allows the owner to renew the registration for a longer period.
+    -- | Requires the current time to prevent renewing expired names.
+    choice Renew : ContractId NameRegistration
+      with
+        currentTime : Time
+        newValidUntil : Time
+      controller owner
+      do
+        assertMsg "Cannot renew an expired name." (validUntil > currentTime)
+        assertMsg "New expiration time must be in the future." (newValidUntil > validUntil)
+        create this with validUntil = newValidUntil
+
+    -- | Allows the owner to grant resolution permission to another party.
+    choice AddObserver : ContractId NameRegistration
+      with
+        partyToAdd : Party
+      controller owner
+      do
+        create this with observers = Set.insert partyToAdd observers
+
+    -- | Allows the owner to revoke resolution permission from another party.
+    choice RemoveObserver : ContractId NameRegistration
+      with
+        partyToRemove : Party
+      controller owner
+      do
+        assertMsg "Cannot remove the owner from the observers list." (partyToRemove /= owner)
+        assertMsg "Cannot remove the authority from the observers list." (partyToRemove /= authority)
+        create this with observers = Set.delete partyToRemove observers
+
+    -- | Initiates the process of transferring ownership to a new party via a `TransferOffer`.
+    choice OfferTransfer : ContractId TransferOffer
+      with
+        newOwner : Party
+      controller owner
+      do
+        assertMsg "Cannot transfer ownership to the current owner." (newOwner /= owner)
+        create TransferOffer with registrationCid = self, ..
+
+
+-- | An offer to transfer ownership of a `NameRegistration` contract from the current
+-- | owner to a new owner.
+template TransferOffer
+  with
+    registrationCid : ContractId NameRegistration
+    newOwner : Party
+  where
+    -- The original owner signs the offer, authorizing the transfer.
+    signatory (signatories (fetch registrationCid))
+    observer newOwner
+
+    -- | The designated new owner accepts the transfer, atomically updating the `NameRegistration`.
+    choice Accept : ContractId NameRegistration
+      controller newOwner
+      do
+        reg <- fetch registrationCid
+        assertMsg "Cannot accept transfer to yourself if you are already the owner." (reg.owner /= newOwner)
+
+        -- The new owner automatically becomes an observer. The old owner is removed
+        -- from the observer set, unless they are the authority.
+        let oldOwner = reg.owner
+            observersWithoutOldOwner = Set.delete oldOwner reg.observers
+            observersWithNewOwner = Set.insert newOwner observersWithoutOldOwner
+
+        -- Create the new registration with the new owner and updated observer list.
+        newCid <- create reg with
+          owner = newOwner
+          observers = observersWithNewOwner
+
+        -- Archive the old registration to complete the transfer.
+        archive registrationCid
+
+        pure newCid
+
+    -- | Either the current owner or the prospective new owner can cancel the transfer offer.
+    choice Cancel : ()
+      controller (signatories (fetch registrationCid)) ++ [newOwner]
+      do
+        pure ()

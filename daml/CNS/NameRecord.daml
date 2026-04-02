@@ -22,6 +22,9 @@ template NameRecordContract
 
     ensure record.name /= "" && record.ttlSeconds > 0
 
+    key (authority, record.name) : (Party, Text)
+    maintainer key._1
+
     choice RenewName : ContractId NameRecordContract
       with renewalSeconds : Int
       controller record.owner
@@ -29,8 +32,14 @@ template NameRecordContract
         now <- getTime
         create this with record = record
           { ttlSeconds = record.ttlSeconds + renewalSeconds
-          , expiresAt  = addRelTime record.expiresAt (convertMicrosecondsToRelTime (intToMicro renewalSeconds * 1_000_000))
+          , expiresAt  = addRelTime record.expiresAt
+              (convertMicrosecondsToRelTime (intToMicro renewalSeconds * 1_000_000))
           }
+
+    choice UpdatePartyId : ContractId NameRecordContract
+      with newPartyId : Party
+      controller record.owner
+      do create this with record = record { partyId = newPartyId }
 
     choice ArchiveRecord : ()
       controller authority

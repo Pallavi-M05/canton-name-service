@@ -1,0 +1,30 @@
+module CNS.Subdomain where
+
+import CNS.NameRecord
+
+template SubdomainDelegation
+  with
+    parentOwner : Party
+    subdomain   : Text
+    parentName  : Text
+    delegate    : Party
+    authority   : Party
+  where
+    signatory parentOwner, authority
+    observer  delegate
+
+    ensure subdomain /= "" && parentName /= ""
+
+    key (authority, subdomain <> "." <> parentName) : (Party, Text)
+    maintainer key._1
+
+    choice RevokeSubdomain : ()
+      controller parentOwner
+      do return ()
+
+    choice TransferSubdomain : ContractId SubdomainDelegation
+      with newDelegate : Party
+      controller parentOwner
+      do
+        archive self
+        create this with delegate = newDelegate

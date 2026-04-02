@@ -1,0 +1,125 @@
+-- | This module defines the core NameRecord template for the Canton Name Service (CNS).
+-- A NameRecord represents a single, unique mapping from a human-readable identifier
+-- to a Canton party ID, with ownership, expiration, and privacy controls.
+module CNS.NameRecord where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+
+-- | A proposal to transfer ownership of a NameRecord.
+-- The new owner must accept the proposal to complete the transfer.
+-- This follows the standard two-phase proposal/acceptance pattern for asset transfers.
+template TransferProposal
+  with
+    nameRecordCid : ContractId NameRecord -- ^ The `NameRecord` contract being transferred.
+    oldOwner : Party                      -- ^ The current owner.
+    newOwner : Party                      -- ^ The proposed new owner.
+  where
+    signatory newOwner
+    observer oldOwner
+
+    -- | The new owner accepts the transfer by exercising the `DoTransfer` choice
+    -- on the original `NameRecord`. This requires a transaction co-signed by the
+    -- `oldOwner` (controller of `DoTransfer`) and the `newOwner` (controller of `Accept`).
+    choice Accept : ContractId NameRecord
+      controller newOwner
+      do
+        exercise nameRecordCid DoTransfer with proposalCid = self, newOwner
+
+    -- | The current owner cancels the transfer proposal before it is accepted.
+    choice Cancel : ()
+      controller oldOwner
+      do
+        pure ()
+
+
+-- | Represents a registered name mapping a human-readable identifier to a Party.
+-- The record has an owner, an expiration time, and a list of authorized resolvers.
+template NameRecord
+  with
+    identifier : Text         -- ^ The human-readable name, e.g., "alice.wallet".
+    owner : Party             -- ^ The party that owns and controls this record.
+    resolvesTo : Party        -- ^ The party this name resolves to.
+    expiresAt : Time          -- ^ The timestamp when this record expires.
+    resolvers : Set Party     -- ^ Parties authorized to resolve this name.
+    registry : Party          -- ^ The operator of the CNS registry.
+  where
+    signatory owner, registry
+    observer resolvesTo, Set.toList resolvers
+
+    key (registry, identifier) : (Party, Text)
+    maintainer owner
+
+    ensure
+      -- On creation, ensure the record is not already expired.
+      getTime >>= \now -> assertMsg "Record expiration must be in the future" (expiresAt > now)
+
+    -- | The owner can renew the registration by extending its expiration time.
+    choice Renew : ContractId NameRecord
+      with
+        newExpiresAt : Time   -- ^ The new expiration timestamp.
+      controller owner
+      do
+        now <- getTime
+        assertMsg "New expiration time must be in the future" (newExpiresAt > now)
+        assertMsg "New expiration must be later than the current one" (newExpiresAt > expiresAt)
+
+        create this with expiresAt = newExpiresAt
+
+    -- | The owner can update the party this name resolves to.
+    choice UpdateResolution : ContractId NameRecord
+      with
+        newParty : Party      -- ^ The new party to resolve the name to.
+      controller owner
+      do
+        create this with resolvesTo = newParty
+
+    -- | The owner can change the set of parties authorized to resolve this name.
+    choice SetResolvers : ContractId NameRecord
+      with
+        newResolvers : Set Party -- ^ The new set of authorized resolvers.
+      controller owner
+      do
+        create this with resolvers = newResolvers
+
+    -- | The owner can initiate a transfer of ownership to a new party.
+    -- This creates a `TransferProposal` contract that the new owner must accept.
+    choice ProposeTransfer : ContractId TransferProposal
+      with
+        newOwner : Party      -- ^ The party to whom ownership is being transferred.
+      controller owner
+      do
+        assertMsg "Cannot propose transfer to self" (newOwner /= owner)
+        create TransferProposal with
+          nameRecordCid = self
+          oldOwner = owner
+          ..
+
+    -- | The owner completes the transfer of ownership. This choice is designed
+    -- to be exercised by the `Accept` choice on the `TransferProposal`, requiring
+    -- co-authorization from both old and new owners.
+    choice DoTransfer : ContractId NameRecord
+      with
+        proposalCid : ContractId TransferProposal
+        newOwner : Party
+      controller owner
+      do
+        -- Verify that the caller is authorized via the provided proposal.
+        proposal <- fetch proposalCid
+        assertMsg "Proposal is for a different NameRecord" (proposal.nameRecordCid == self)
+        assertMsg "Proposal was initiated by a different owner" (proposal.oldOwner == owner)
+        assertMsg "Proposal designated a different new owner" (proposal.newOwner == newOwner)
+
+        -- The proposal is now consumed.
+        archive proposalCid
+
+        -- Create the new record with the new owner.
+        create this with owner = newOwner
+
+    -- | The owner can delete their name record.
+    -- This is a consuming choice that archives the contract.
+    choice Delete : ()
+      controller owner
+      do
+        pure ()

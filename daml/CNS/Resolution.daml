@@ -1,0 +1,37 @@
+module CNS.Resolution where
+
+import CNS.NameRecord
+
+template ResolutionRequest
+  with
+    requester  : Party
+    name       : Text
+    authority  : Party
+  where
+    signatory requester
+    observer  authority
+
+    choice ResolveToParty : ContractId ResolutionResult
+      with
+        resolvedParty : Party
+        nameRecordCid : ContractId NameRecordContract
+      controller authority
+      do
+        nameRec <- fetch nameRecordCid
+        assertMsg "Name mismatch in resolution" (nameRec.record.name == name)
+        create ResolutionResult
+          with
+            requester
+            name
+            resolvedParty
+            authority
+
+template ResolutionResult
+  with
+    requester     : Party
+    name          : Text
+    resolvedParty : Party
+    authority     : Party
+  where
+    signatory authority
+    observer  requester, resolvedParty

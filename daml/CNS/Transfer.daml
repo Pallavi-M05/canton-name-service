@@ -1,0 +1,31 @@
+module CNS.Transfer where
+
+import CNS.NameRecord
+
+template NameTransferProposal
+  with
+    currentOwner : Party
+    newOwner     : Party
+    nameRecord   : ContractId NameRecordContract
+    authority    : Party
+    lockUpSeconds: Int
+  where
+    signatory currentOwner
+    observer  newOwner, authority
+
+    choice AcceptTransfer : ContractId NameRecordContract
+      controller newOwner
+      do
+        rec <- fetch nameRecord
+        archive nameRecord
+        create NameRecordContract with
+          record = rec.record { owner = newOwner }
+          authority
+
+    choice RejectTransfer : ()
+      controller newOwner
+      do return ()
+
+    choice RevokeTransfer : ()
+      controller currentOwner
+      do return ()

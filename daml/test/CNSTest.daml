@@ -1,0 +1,50 @@
+module CNSTest where
+
+import Daml.Script
+import CNS.NameRecord
+import CNS.Resolution
+import CNS.Transfer
+
+setup : Script ()
+setup = script do
+  authority <- allocateParty "CNS-Authority"
+  alice     <- allocateParty "Alice"
+  bob       <- allocateParty "Bob"
+
+  now <- getTime
+
+  -- Register a name for Alice
+  let record = NameRecord
+        { name         = "alice.canton"
+        , partyId      = alice
+        , owner        = alice
+        , registrar    = authority
+        , ttlSeconds   = 365 * 86400
+        , registeredAt = now
+        , expiresAt    = addRelTime now (convertMicrosecondsToRelTime (365 * 86400 * 1_000_000))
+        }
+  nameCid <- submit authority do
+    createCmd NameRecordContract with record; authority
+
+  -- Resolve alice.canton
+  reqCid <- submit alice do
+    createCmd ResolutionRequest with
+      requester = alice; name = "alice.canton"; authority
+
+  submit authority do
+    exerciseCmd reqCid ResolveToParty with
+      resolvedParty = alice; nameRecordCid = nameCid
+
+  -- Transfer alice.canton to Bob
+  transferCid <- submit alice do
+    createCmd NameTransferProposal with
+      currentOwner  = alice
+      newOwner      = bob
+      nameRecord    = nameCid
+      authority
+      lockUpSeconds = 86400
+
+  submit bob do
+    exerciseCmd transferCid AcceptTransfer
+
+  return ()

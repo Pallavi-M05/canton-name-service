@@ -1,31 +1,64 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module CNS.Transfer where
 
-import CNS.NameRecord
+import CNS.NameRecord (NameRecord)
 
+-- | Represents a pending transfer of a CNS name record from a current owner
+-- | to a new owner. This contract follows the proposal/acceptance pattern,
+-- | requiring the new owner to explicitly accept the transfer before it is
+-- | finalized on the main `NameRecord` contract.
+-- |
+-- | The creation of this proposal is typically initiated by a choice on the
+-- | `NameRecord` template, which would also enforce any transfer lock-up
+-- | periods.
 template NameTransferProposal
   with
+    nameRecordCid : ContractId NameRecord
+      -- ^ The contract ID of the `NameRecord` being transferred.
     currentOwner : Party
-    newOwner     : Party
-    nameRecord   : ContractId NameRecordContract
-    authority    : Party
-    lockUpSeconds: Int
+      -- ^ The party initiating the transfer, who currently owns the name.
+    newOwner : Party
+      -- ^ The party who will become the new owner upon acceptance.
+    operator : Party
+      -- ^ The operator of the CNS registry.
   where
     signatory currentOwner
-    observer  newOwner, authority
+    observer newOwner, operator
 
-    choice AcceptTransfer : ContractId NameRecordContract
+    ensure currentOwner /= newOwner
+
+    key (currentOwner, operator, nameRecordCid) : (Party, Party, ContractId NameRecord)
+    maintainer key._1
+
+    -- | The designated new owner can accept the transfer. This action
+    -- | exercises the `Transfer` choice on the original `NameRecord` contract,
+    -- | completing the ownership change. The authority of both `currentOwner`
+    -- | (as signatory of this proposal) and `newOwner` (as controller of this
+    -- | choice) are combined in the transaction, allowing the `Transfer` choice
+    -- | on the `NameRecord` to be successfully exercised.
+    choice AcceptTransfer : ContractId NameRecord
       controller newOwner
       do
-        rec <- fetch nameRecord
-        archive nameRecord
-        create NameRecordContract with
-          record = rec.record { owner = newOwner }
-          authority
+        -- Fetch the target record to ensure it's still valid and owned by the proposer.
+        nameRecord <- fetch nameRecordCid
+        assertMsg "The proposer is no longer the owner of this name record."
+          (nameRecord.owner == currentOwner)
 
+        -- The core action: exercise the transfer choice on the name record.
+        -- This choice is responsible for archiving the old record and creating the
+        -- new one with the updated owner and lock-up period.
+        exercise nameRecordCid NameRecord.Transfer with newOwner = newOwner
+
+    -- | The designated new owner can reject the transfer proposal, which archives it.
     choice RejectTransfer : ()
       controller newOwner
-      do return ()
+      do
+        archive self
 
-    choice RevokeTransfer : ()
+    -- | The current owner can withdraw their transfer proposal before it's accepted.
+    choice WithdrawTransfer : ()
       controller currentOwner
-      do return ()
+      do
+        archive self

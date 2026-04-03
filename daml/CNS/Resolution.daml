@@ -1,37 +1,162 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module CNS.Resolution where
 
-import CNS.NameRecord
+import Daml.Script
+import CNS.NameRecord (NameRecord)
 
+-- | Represents a request from one party to resolve a CNS name owned by another.
+-- This contract follows the standard proposal-acceptance pattern. The `requester`
+-- initiates this, and the `resolver` (the name owner) can accept or decline it.
 template ResolutionRequest
   with
-    requester  : Party
-    name       : Text
-    authority  : Party
+    requester: Party
+      -- ^ The party requesting the resolution.
+    resolver: Party
+      -- ^ The party who owns the name and can resolve it.
+    name: Text
+      -- ^ The human-readable CNS name to be resolved.
   where
     signatory requester
-    observer  authority
+    observer resolver
 
-    choice ResolveToParty : ContractId ResolutionResult
+    ensure requester /= resolver
+
+    key (requester, resolver, name) : (Party, Party, Text)
+    maintainer key._1
+
+    choice AcceptResolution : ContractId Resolution
+      -- ^ The resolver accepts the request, fetches the corresponding NameRecord,
+      -- and creates a private Resolution contract for the requester.
       with
-        resolvedParty : Party
-        nameRecordCid : ContractId NameRecordContract
-      controller authority
+        nameRecordCid: ContractId NameRecord
+          -- ^ The contract ID of the NameRecord that corresponds to the requested name.
+          -- The resolver must provide this to prove ownership.
+      controller resolver
       do
-        nameRec <- fetch nameRecordCid
-        assertMsg "Name mismatch in resolution" (nameRec.record.name == name)
-        create ResolutionResult
-          with
-            requester
-            name
-            resolvedParty
-            authority
+        -- Fetch the name record to verify ownership and get the resolved party.
+        nameRecord <- fetch nameRecordCid
 
-template ResolutionResult
+        -- Ensure the controller of this choice is the owner of the provided NameRecord.
+        assertMsg "Resolver must be the owner of the NameRecord to accept a resolution."
+          (nameRecord.owner == resolver)
+
+        -- Ensure the provided NameRecord is for the name that was requested.
+        assertMsg "The provided NameRecord does not match the requested name."
+          (nameRecord.name == name)
+
+        -- Create the Resolution contract, making the resolved party visible
+        -- only to the requester and the resolver.
+        create Resolution with
+          requester = requester
+          resolver = resolver
+          name = name
+          resolvedParty = nameRecord.resolvedParty
+          nameRecordCid = nameRecordCid
+
+    choice DeclineResolution : ()
+      -- ^ The resolver declines the request, archiving it without creating a resolution.
+      controller resolver
+      do
+        pure ()
+
+-- | Represents a successful, private resolution of a CNS name.
+-- This contract is visible only to the requester and the resolver, preserving the privacy
+-- of the resolution event and the resolved Party ID.
+template Resolution
   with
-    requester     : Party
-    name          : Text
-    resolvedParty : Party
-    authority     : Party
+    requester: Party
+      -- ^ The party who requested the resolution.
+    resolver: Party
+      -- ^ The party who owned the name and approved the resolution.
+    name: Text
+      -- ^ The human-readable CNS name.
+    resolvedParty: Party
+      -- ^ The Canton Party ID that the name resolves to.
+    nameRecordCid: ContractId NameRecord
+      -- ^ A reference to the original NameRecord for provenance and verification.
   where
-    signatory authority
-    observer  requester, resolvedParty
+    signatory requester, resolver
+
+    key (requester, resolver, name) : (Party, Party, Text)
+    maintainer key._1
+
+
+-- === Test Script ===
+-- A comprehensive test script demonstrating the resolution flow.
+test_resolution_flow = script do
+  -- 1. Setup Parties
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "charlie")
+
+  -- 2. Setup: Alice creates a name record for herself.
+  aliceNameRecordCid <- submit alice do
+    create NameRecord with
+      owner = alice
+      name = "alice.cns"
+      resolvedParty = alice
+      observers = []
+
+  -- 3. Happy Path: Bob successfully resolves Alice's name.
+  -- 3a. Bob sends a request to Alice.
+  bobRequestId <- submit bob do
+    create ResolutionRequest with
+      requester = bob
+      resolver = alice
+      name = "alice.cns"
+
+  -- 3b. Alice sees the request and accepts it, providing her NameRecord CID.
+  bobResolutionCid <- submit alice do
+    exercise bobRequestId AcceptResolution with nameRecordCid = aliceNameRecordCid
+
+  -- 3c. Validation: Check if the resolution contract was created correctly.
+  bobResolutionContract <- fetch bobResolutionCid
+  assert (bobResolutionContract.requester == bob)
+  assert (bobResolutionContract.resolver == alice)
+  assert (bobResolutionContract.name == "alice.cns")
+  assert (bobResolutionContract.resolvedParty == alice)
+  assert (bobResolutionContract.nameRecordCid == aliceNameRecordCid)
+  debug ("Successfully resolved 'alice.cns' for Bob as " <> show alice)
+
+  -- 4. Decline Path: Charlie requests, but Alice declines.
+  -- 4a. Charlie sends a request to Alice.
+  charlieRequestId <- submit charlie do
+    create ResolutionRequest with
+      requester = charlie
+      resolver = alice
+      name = "alice.cns"
+
+  -- 4b. Alice declines the request.
+  submit alice do
+    exercise charlieRequestId DeclineResolution
+
+  -- 4c. Validation: Ensure the request from Charlie is archived and no resolution contract was created.
+  submitMustFail charlie do fetch charlieRequestId
+  query @Resolution charlie >>= \res -> assertMsg "No resolution contract should exist for Charlie" (res == [])
+  debug "Successfully tested Alice declining Charlie's request."
+
+  -- 5. Failure Path: Alice tries to accept with the wrong NameRecord.
+  -- 5a. Alice creates an alternative record.
+  aliceAltRecordCid <- submit alice do
+    create NameRecord with
+      owner = alice
+      name = "alice-work.cns"
+      resolvedParty = alice
+      observers = []
+
+  -- 5b. Bob sends another request for the original name.
+  bobRequestId2 <- submit bob do
+    create ResolutionRequest with
+      requester = bob
+      resolver = alice
+      name = "alice.cns"
+
+  -- 5c. Alice tries to accept using the wrong record ("alice-work.cns").
+  -- This submitMustFail because the assertion `nameRecord.name == name` will trigger.
+  submitMustFail alice do
+    exercise bobRequestId2 AcceptResolution with nameRecordCid = aliceAltRecordCid
+  debug "Successfully tested failure when providing the wrong NameRecord."
+
+  pure ()

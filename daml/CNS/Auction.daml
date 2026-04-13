@@ -1,0 +1,334 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module CNS.Auction where
+
+import Daml.Script
+
+import DA.Time (Time, addRelTime, relTime)
+import DA.List (sortOn, head, tail)
+import DA.Optional (isSome, fromOptional)
+import DA.Text (Text, show, pack)
+import DA.Foldable (forA_, forA)
+import DA.Finance.Utils.Hash (sha256)
+import DA.Assert ((===))
+
+import CNS.Registry (Name, NameRegistrationRequest(..))
+
+-- In a production setting, this would be a CIP-0056 compliant token.
+-- For this example, we use a simple IOU token definition within the test script.
+import qualified CNS.Token as Token
+
+-- | Represents a sealed-bid auction for a premium CNS name.
+-- The auction proceeds in three phases:
+-- 1. Bidding Phase: (now < biddingDeadline) Bidders submit proposals with a hash of their bid.
+-- 2. Reveal Phase: (biddingDeadline <= now < revealDeadline) Bidders reveal their bids.
+-- 3. Conclude Phase: (now >= revealDeadline) The registry concludes the auction, determining the winner.
+template Auction
+  with
+    registry: Party          -- ^ The CNS registry operator.
+    name: Text               -- ^ The premium name being auctioned.
+    biddingDeadline: Time    -- ^ Bids must be placed before this time.
+    revealDeadline: Time     -- ^ Bids must be revealed before this time.
+    currency: Party          -- ^ The issuer of the currency for settlement.
+    minBid: Decimal          -- ^ The minimum bid amount.
+    depositAmount: Decimal   -- ^ The required deposit to participate.
+  where
+    signatory registry
+
+    key (registry, name) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      biddingDeadline < revealDeadline
+
+    -- | A potential bidder proposes to place a sealed bid.
+    -- They must provide a hash of their bid amount and a secret nonce.
+    choice ProposeBid : ContractId BidProposal
+      with
+        bidder: Party
+        bidHash: Text
+      controller bidder
+      do
+        now <- getTime
+        assertMsg "Bidding period has ended" (now < biddingDeadline)
+
+        create BidProposal with
+          registry
+          bidder
+          auctionCid = self
+          bidHash
+
+    -- | The registry accepts the bid proposal, creating a sealed `Bid` contract.
+    -- The bidder must provide a token contract representing the required deposit.
+    choice AcceptBid : ContractId Bid
+      with
+        proposalCid: ContractId BidProposal
+        depositCid: ContractId Token.Iou -- ^ An IOU of `depositAmount` owned by bidder.
+      controller registry
+      do
+        proposal <- fetch proposalCid
+        deposit <- fetch depositCid
+
+        -- Verify the deposit is correct
+        deposit.amount === depositAmount
+        deposit.issuer === currency
+        deposit.owner === proposal.bidder
+
+        archive proposalCid
+        create Bid with ..
+
+    -- | The registry concludes the auction after the reveal period.
+    -- This choice identifies the winner and creates settlement contracts.
+    choice Conclude : ()
+      with
+        revealedBidCids: [ContractId RevealedBid]
+      controller registry
+      do
+        now <- getTime
+        assertMsg "Reveal period has not yet ended" (now >= revealDeadline)
+
+        revealedBids <- forA revealedBidCids fetch
+
+        -- Validate that all provided bids belong to this auction
+        forA_ revealedBids $ \bid ->
+          assertMsg "A revealed bid does not belong to this auction" (bid.auctionCid == self)
+
+        if null revealedBids then
+          -- No valid bids were revealed. The auction is cancelled.
+          -- Bidders can reclaim their deposits using the fallback choice on the `Bid` contract.
+          archive self
+        else do
+          -- Sort bids by amount, descending. Tie-breaking is implicit: first submitted wins.
+          let sortedBids = sortOn (\bid -> 0.0 - bid.amount) revealedBids
+          let winningBid = fromOptional (head sortedBids)
+          let losingBids = fromOptional (tail sortedBids)
+
+          -- Create the winning contract
+          create AuctionWinner with
+            registry = winningBid.registry
+            winner = winningBid.bidder
+            name = name
+            amount = winningBid.amount
+            currency = currency
+            depositCid = winningBid.depositCid
+
+          -- Create contracts for losers to reclaim their deposits
+          forA_ losingBids $ \losingBid ->
+            create AuctionLoser with
+              registry = losingBid.registry
+              loser = losingBid.bidder
+              depositCid = losingBid.depositCid
+
+          -- Archive all the revealed bid contracts as they are now processed
+          forA_ revealedBidCids archive
+          -- Archive the main auction contract
+          archive self
+
+
+-- | A proposal from a bidder to enter the auction.
+template BidProposal
+  with
+    registry: Party
+    bidder: Party
+    auctionCid: ContractId Auction
+    bidHash: Text
+  where
+    signatory registry, bidder
+
+
+-- | A sealed bid, placed by a bidder. The amount is hidden in the hash.
+template Bid
+  with
+    registry: Party
+    bidder: Party
+    auctionCid: ContractId Auction
+    bidHash: Text
+    depositCid: ContractId Token.Iou
+  where
+    signatory registry, bidder
+
+    -- | The bidder reveals their bid amount and nonce after the bidding deadline.
+    choice Reveal : ContractId RevealedBid
+      with
+        amount: Decimal
+        nonce: Text
+      controller bidder
+      do
+        auction <- fetch auctionCid
+
+        now <- getTime
+        assertMsg "Bidding period has not yet ended" (now >= auction.biddingDeadline)
+        assertMsg "Reveal period has ended" (now < auction.revealDeadline)
+
+        -- Verify the bid amount and nonce against the committed hash
+        let expectedHash = sha256 (pack [show amount, nonce])
+        assertMsg "Bid amount/nonce does not match original hash" (expectedHash == bidHash)
+        assertMsg ("Bid must be at least " <> show auction.minBid) (amount >= auction.minBid)
+
+        create RevealedBid with ..
+
+    -- | Fallback choice for a bidder to reclaim their deposit if the auction is
+    -- cancelled or if the registry fails to conclude it in a timely manner.
+    choice ReclaimDepositAfterExpiry : ContractId Token.Iou
+      controller bidder
+      do
+        optionalAuction <- lookupContract @Auction auctionCid
+        case optionalAuction of
+          Some auction -> do
+            now <- getTime
+            assertMsg "Cannot reclaim deposit until after reveal period" (now > auction.revealDeadline)
+          None -> pure ()
+
+        deposit <- fetch depositCid
+        archive self
+        create deposit
+
+
+-- | A bid that has been successfully revealed.
+template RevealedBid
+  with
+    registry: Party
+    bidder: Party
+    auctionCid: ContractId Auction
+    amount: Decimal
+    depositCid: ContractId Token.Iou
+  where
+    signatory registry, bidder
+    key (registry, auctionCid, bidder) : (Party, ContractId Auction, Party)
+    maintainer key._1
+
+
+-- | Contract for the auction winner to complete the settlement.
+template AuctionWinner
+  with
+    registry: Party
+    winner: Party
+    name: Text
+    amount: Decimal
+    currency: Party
+    depositCid: ContractId Token.Iou -- ^ The winner's original deposit
+  where
+    signatory registry, winner
+
+    -- | The winner provides a payment token and claims the name (DvP).
+    choice Settle : ContractId Name
+      with
+        paymentCid: ContractId Token.Iou -- ^ A token for `amount` owned by `winner`
+      controller winner
+      do
+        payment <- fetch paymentCid
+        deposit <- fetch depositCid
+
+        payment.amount === amount
+        payment.issuer === currency
+        payment.owner === winner
+
+        -- 1. Transfer payment to registry by exercising payment token.
+        exercise paymentCid Token.Transfer with newOwner = registry
+
+        -- 2. Return the winner's deposit.
+        exercise depositCid Token.Transfer with newOwner = winner
+
+        -- 3. Create the CNS Name registration for the winner.
+        requestCid <- create NameRegistrationRequest with name, owner = winner, registry
+        exercise requestCid NameRegistrationRequest_Accept
+
+
+-- | Contract for a losing bidder to reclaim their deposit.
+template AuctionLoser
+  with
+    registry: Party
+    loser: Party
+    depositCid: ContractId Token.Iou
+  where
+    signatory registry, loser
+
+    choice ReclaimDeposit : ContractId Token.Iou
+      controller loser
+      do
+        exercise depositCid Token.Transfer with newOwner = loser
+
+
+-- | Test script demonstrating the full auction lifecycle.
+testAuction : Script ()
+testAuction = script do
+  registry <- allocatePartyWithHint "Registry" (PartyIdHint "registry")
+  usdcIssuer <- allocatePartyWithHint "USDC-Issuer" (PartyIdHint "usdc-issuer")
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+
+  now <- getTime
+  let biddingDeadline = addRelTime now (relTime 60 0 0) -- 1 minute
+  let revealDeadline = addRelTime biddingDeadline (relTime 60 0 0) -- 2 minutes from now
+  let nameToAuction = "premium"
+  let minBid = 100.0
+  let depositAmount = 10.0
+
+  -- 1. Setup: Create Auction and fund bidders
+  auctionCid <- submit registry do
+    createCmd Auction with registry, name = nameToAuction, biddingDeadline, revealDeadline,
+                          currency = usdcIssuer, minBid, depositAmount
+
+  aliceDepositCid <- submit usdcIssuer do createCmd Token.Iou with issuer = usdcIssuer, owner = alice, amount = depositAmount
+  bobDepositCid <- submit usdcIssuer do createCmd Token.Iou with issuer = usdcIssuer, owner = bob, amount = depositAmount
+
+  alicePaymentCid <- submit usdcIssuer do createCmd Token.Iou with issuer = usdcIssuer, owner = alice, amount = 150.0
+  bobPaymentCid <- submit usdcIssuer do createCmd Token.Iou with issuer = usdcIssuer, owner = bob, amount = 120.0
+
+  -- 2. Bidding Phase
+  debug "Bidding phase started"
+  let (aliceBidAmount, aliceNonce) = (150.0, "alice-secret-1")
+  let aliceHash = sha256 (pack [show aliceBidAmount, aliceNonce])
+  aliceProposalCid <- submit alice do exerciseCmd auctionCid ProposeBid with bidder = alice, bidHash = aliceHash
+  aliceBidCid <- submit registry do exerciseCmd aliceProposalCid AcceptBid with depositCid = aliceDepositCid
+
+  let (bobBidAmount, bobNonce) = (120.0, "bob-secret-2")
+  let bobHash = sha256 (pack [show bobBidAmount, bobNonce])
+  bobProposalCid <- submit bob do exerciseCmd auctionCid ProposeBid with bidder = bob, bidHash = bobHash
+  bobBidCid <- submit registry do exerciseCmd bobProposalCid AcceptBid with depositCid = bobDepositCid
+
+  passRelTime (relTime 61 0 0)
+  debug "Bidding phase ended"
+
+  -- 3. Reveal Phase
+  debug "Reveal phase started"
+  aliceRevealedCid <- submit alice do exerciseCmd aliceBidCid Reveal with amount = aliceBidAmount, nonce = aliceNonce
+  bobRevealedCid <- submit bob do exerciseCmd bobBidCid Reveal with amount = bobBidAmount, nonce = bobNonce
+
+  passRelTime (relTime 61 0 0)
+  debug "Reveal phase ended"
+
+  -- 4. Conclusion
+  debug "Concluding auction"
+  submit registry do
+    exerciseCmd auctionCid Conclude with revealedBidCids = [aliceRevealedCid, bobRevealedCid]
+
+  -- 5. Settlement
+  debug "Settlement phase started"
+  Some (winnerCid, _) <- queryContractKey @AuctionWinner alice (registry, alice, nameToAuction)
+  nameCid <- submit alice do exerciseCmd winnerCid Settle with paymentCid = alicePaymentCid
+
+  Some (loserCid, _) <- queryContractKey @AuctionLoser bob (registry, bob)
+  _ <- submit bob do exerciseCmd loserCid ReclaimDeposit
+
+  -- 6. Verification
+  debug "Verifying results"
+  Some nameContract <- queryContractId @Name alice nameCid
+  nameContract.owner === alice
+  nameContract.name === nameToAuction
+  debug ("Name '" <> nameToAuction <> "' successfully registered to Alice.")
+
+  aliceTokens <- map (.payload) <$> query @Token.Iou alice
+  sum (map (.amount) aliceTokens) === depositAmount
+  debug "Alice's deposit was correctly returned."
+
+  bobTokens <- map (.payload) <$> query @Token.Iou bob
+  sum (map (.amount) bobTokens) === depositAmount + bobBidAmount
+  debug "Bob's deposit and unspent bid amount are correctly in his possession."
+
+  registryTokens <- map (.payload) <$> query @Token.Iou registry
+  sum (map (.amount) registryTokens) === aliceBidAmount
+  debug "Registry correctly received Alice's winning bid amount."
+
+  pure ()
